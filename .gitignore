@@ -1,0 +1,32 @@
+# Build directories
+build/
+build_client/
+build_server/
+temp/
+
+# CMake generated files
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+compile_commands.json
+
+# Compiled outputs
+*.o
+*.a
+*.so
+*.exe
+*.out
+
+# Logs
+log/
+*.log
+
+# Local config
+config.ini
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
