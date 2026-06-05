@@ -3,13 +3,11 @@
 #include <math.h>
 #include <string.h>
 
-#define YIN_MIN_PITCH_HZ 80U
-#define YIN_MAX_PITCH_HZ 2000U
-#define YIN_THRESHOLD 0.20f
-#define YIN_FALLBACK_THRESHOLD 0.35f
-#define YIN_MIN_RMS 400.0f
-#define YIN_MAX_SAMPLES 2048U
-#define YIN_MAX_TAU 1024U
+#define DETECTOR_MIN_MIDI_NOTE 33
+#define DETECTOR_MAX_MIDI_NOTE 96
+#define DETECTOR_MIN_RMS 180.0f
+#define DETECTOR_MIN_SCORE 0.035f
+#define DETECTOR_MAX_SAMPLES 4096U
 #define A4_FREQUENCY_HZ 440.0f
 #define A4_MIDI_NOTE 69
 
@@ -32,23 +30,44 @@ static void reset_result(PitchDetectionResult *result) {
  * @return The sample count safe for local buffers.
  */
 static size_t clamp_sample_count(size_t sample_count) {
-    return sample_count > YIN_MAX_SAMPLES ? YIN_MAX_SAMPLES : sample_count;
+    return sample_count > DETECTOR_MAX_SAMPLES ? DETECTOR_MAX_SAMPLES : sample_count;
 }
 
 /**
- * Removes DC offset, applies a Hann window, and computes RMS energy.
+ * Converts a MIDI note to its equal-tempered frequency.
+ * @param midi_note The MIDI note number.
+ * @return The frequency in Hz.
+ */
+static float midi_note_to_frequency(int midi_note) {
+    return A4_FREQUENCY_HZ * powf(2.0f, ((float)midi_note - A4_MIDI_NOTE) / 12.0f);
+}
+
+/**
+ * Rounds a MIDI note frequency to an integer frequency.
+ * @param midi_note The MIDI note number.
+ * @return The rounded frequency in Hz.
+ */
+static int midi_note_to_frequency_hz(int midi_note) {
+    return (int)lroundf(midi_note_to_frequency(midi_note));
+}
+
+/**
+ * Removes DC offset, computes raw RMS energy, and applies a Hann window.
  * @param samples The input PCM samples.
- * @param processed Receives normalized floating-point samples.
+ * @param processed Receives floating-point samples for frequency analysis.
  * @param sample_count The number of samples to preprocess.
- * @return The RMS energy of the processed window.
+ * @param energy Receives the processed signal energy.
+ * @return The raw RMS energy before windowing.
  */
 static float preprocess_samples(
     const int16_t *samples,
     float *processed,
-    size_t sample_count
+    size_t sample_count,
+    double *energy
 ) {
     double mean = 0.0;
     double square_sum = 0.0;
+    double windowed_energy = 0.0;
     size_t i;
 
     for (i = 0; i < sample_count; i++) {
@@ -58,6 +77,7 @@ static float preprocess_samples(
 
     for (i = 0; i < sample_count; i++) {
         float centered = (float)((double)samples[i] - mean);
+        const float energy_sample = centered;
 
         if (sample_count > 1) {
             const float phase = (float)i / (float)(sample_count - 1U);
@@ -66,181 +86,66 @@ static float preprocess_samples(
         }
 
         processed[i] = centered;
-        square_sum += (double)centered * (double)centered;
+        square_sum += (double)energy_sample * (double)energy_sample;
+        windowed_energy += (double)centered * (double)centered;
     }
 
+    *energy = windowed_energy;
     return (float)sqrt(square_sum / (double)sample_count);
 }
 
 /**
- * Fills the YIN difference function for every tested lag.
- * @param yin The YIN buffer to write.
- * @param samples The preprocessed input samples.
- * @param sample_count The number of input samples.
- * @param max_tau The maximum lag to test.
+ * Measures the energy around a target frequency using the Goertzel algorithm.
+ * @param samples The preprocessed sample window.
+ * @param sample_count The number of samples in the window.
+ * @param sample_rate The sample rate in Hz.
+ * @param frequency_hz The target frequency in Hz.
+ * @param energy The total energy of the preprocessed sample window.
+ * @return The normalized target-frequency score.
  */
-static void fill_difference_function(
-    float *yin,
+static float goertzel_score(
     const float *samples,
     size_t sample_count,
-    size_t max_tau
+    uint32_t sample_rate,
+    float frequency_hz,
+    double energy
 ) {
-    size_t tau;
+    const float omega = 2.0f * (float)M_PI * frequency_hz / (float)sample_rate;
+    const float coefficient = 2.0f * cosf(omega);
+    float previous = 0.0f;
+    float previous2 = 0.0f;
+    float power;
+    size_t i;
 
-    yin[0] = 0.0f;
-
-    for (tau = 1; tau <= max_tau; tau++) {
-        float difference = 0.0f;
-        size_t i;
-
-        for (i = 0; i + tau < sample_count; i++) {
-            const float delta = samples[i] - samples[i + tau];
-            difference += delta * delta;
-        }
-
-        yin[tau] = difference;
-    }
-}
-
-/**
- * Applies cumulative mean normalized difference to the YIN buffer.
- * @param yin The YIN buffer to normalize in place.
- * @param max_tau The maximum lag stored in the buffer.
- */
-static void normalize_difference_function(float *yin, size_t max_tau) {
-    float running_sum = 0.0f;
-    size_t tau;
-
-    yin[0] = 1.0f;
-
-    for (tau = 1; tau <= max_tau; tau++) {
-        running_sum += yin[tau];
-
-        if (running_sum == 0.0f) {
-            yin[tau] = 1.0f;
-        }
-        else {
-            yin[tau] = yin[tau] * (float)tau / running_sum;
-        }
-    }
-}
-
-/**
- * Finds the first lag that passes the primary YIN threshold.
- * @param yin The normalized YIN buffer.
- * @param min_tau The minimum allowed lag.
- * @param max_tau The maximum allowed lag.
- * @return The detected lag, or 0 if none is found.
- */
-static size_t find_first_pitch_tau(
-    const float *yin,
-    size_t min_tau,
-    size_t max_tau
-) {
-    size_t tau;
-
-    for (tau = min_tau; tau <= max_tau; tau++) {
-        if (yin[tau] < YIN_THRESHOLD) {
-            while (tau + 1 <= max_tau && yin[tau + 1] < yin[tau]) {
-                tau++;
-            }
-            return tau;
-        }
+    if (energy <= 0.0) {
+        return 0.0f;
     }
 
-    return 0;
-}
-
-/**
- * Finds a weaker fallback lag for holding existing notes.
- * @param yin The normalized YIN buffer.
- * @param min_tau The minimum allowed lag.
- * @param max_tau The maximum allowed lag.
- * @return The fallback lag, or 0 if confidence is too low.
- */
-static size_t find_best_fallback_tau(
-    const float *yin,
-    size_t min_tau,
-    size_t max_tau
-) {
-    float best_value = 1.0f;
-    size_t best_tau = 0;
-    size_t tau;
-
-    for (tau = min_tau; tau <= max_tau; tau++) {
-        if (yin[tau] < best_value) {
-            best_value = yin[tau];
-            best_tau = tau;
-        }
+    for (i = 0; i < sample_count; i++) {
+        const float current = samples[i] + coefficient * previous - previous2;
+        previous2 = previous;
+        previous = current;
     }
 
-    if (best_tau == 0 || best_value > YIN_FALLBACK_THRESHOLD) {
-        return 0;
+    power = previous2 * previous2 + previous * previous - coefficient * previous * previous2;
+    if (power <= 0.0f) {
+        return 0.0f;
     }
 
-    return best_tau;
+    return power / ((float)energy * (float)sample_count);
 }
 
-/**
- * Refines a detected lag using parabolic interpolation.
- * @param yin The normalized YIN buffer.
- * @param tau The integer lag to refine.
- * @param max_tau The maximum valid lag.
- * @return The refined fractional lag.
- */
-static float refine_tau_with_parabolic_interpolation(
-    const float *yin,
-    size_t tau,
-    size_t max_tau
-) {
-    float better_tau = (float)tau;
-
-    if (tau > 0 && tau + 1 <= max_tau) {
-        const float left = yin[tau - 1];
-        const float center = yin[tau];
-        const float right = yin[tau + 1];
-        const float denominator = left - 2.0f * center + right;
-
-        if (fabsf(denominator) > 0.000001f) {
-            better_tau += 0.5f * (left - right) / denominator;
-        }
-    }
-
-    return better_tau;
-}
-
-/**
- * Converts a frequency to the nearest equal-tempered MIDI note.
- * @param frequency_hz The frequency in Hz.
- * @return The nearest MIDI note number.
- */
-static int frequency_to_midi_note(float frequency_hz) {
-    return (int)lroundf(12.0f * log2f(frequency_hz / A4_FREQUENCY_HZ) + A4_MIDI_NOTE);
-}
-
-/**
- * Converts a MIDI note to its equal-tempered frequency.
- * @param midi_note The MIDI note number.
- * @return The rounded frequency in Hz.
- */
-static int midi_note_to_frequency(int midi_note) {
-    const float frequency = A4_FREQUENCY_HZ * powf(2.0f, ((float)midi_note - A4_MIDI_NOTE) / 12.0f);
-    return (int)lroundf(frequency);
-}
-
-int pitch_detect_yin(
+int pitch_detect_note(
     const int16_t *samples,
     size_t sample_count,
     uint32_t sample_rate,
     PitchDetectionResult *result
 ) {
-    float processed[YIN_MAX_SAMPLES];
-    float yin[YIN_MAX_TAU + 1U];
-    size_t min_tau;
-    size_t max_tau;
-    size_t best_tau;
-    float better_tau;
-    float raw_frequency;
+    float processed[DETECTOR_MAX_SAMPLES];
+    double energy = 0.0;
+    float best_score = 0.0f;
+    int best_midi_note = -1;
+    int midi_note;
 
     reset_result(result);
 
@@ -249,73 +154,57 @@ int pitch_detect_yin(
     }
 
     sample_count = clamp_sample_count(sample_count);
-    result->rms = preprocess_samples(samples, processed, sample_count);
-    if (result->rms < YIN_MIN_RMS) {
+    result->rms = preprocess_samples(samples, processed, sample_count, &energy);
+    if (result->rms < DETECTOR_MIN_RMS || energy <= 0.0) {
         return 0;
     }
 
-    min_tau = sample_rate / YIN_MAX_PITCH_HZ;
-    max_tau = sample_rate / YIN_MIN_PITCH_HZ;
+    for (midi_note = DETECTOR_MIN_MIDI_NOTE; midi_note <= DETECTOR_MAX_MIDI_NOTE; midi_note++) {
+        const float frequency_hz = midi_note_to_frequency(midi_note);
+        float score;
 
-    if (min_tau < 2U) {
-        min_tau = 2U;
+        if (frequency_hz >= (float)sample_rate * 0.5f) {
+            break;
+        }
+
+        score = goertzel_score(processed,
+            sample_count,
+            sample_rate,
+            frequency_hz,
+            energy);
+
+        if (score > best_score) {
+            best_score = score;
+            best_midi_note = midi_note;
+        }
     }
-    if (max_tau > YIN_MAX_TAU) {
-        max_tau = YIN_MAX_TAU;
-    }
-    if (max_tau >= sample_count / 2U) {
-        max_tau = sample_count / 2U;
-    }
-    if (max_tau <= min_tau) {
+
+    if (best_midi_note < 0 || best_score < DETECTOR_MIN_SCORE) {
+        result->confidence = best_score;
         return 0;
     }
 
-    fill_difference_function(yin, processed, sample_count, max_tau);
-    normalize_difference_function(yin, max_tau);
-
-    best_tau = find_first_pitch_tau(yin, min_tau, max_tau);
-    if (best_tau == 0) {
-        best_tau = find_best_fallback_tau(yin, min_tau, max_tau);
-        result->fallback = best_tau != 0;
+    if (best_score > 1.0f) {
+        best_score = 1.0f;
     }
 
-    if (best_tau == 0) {
-        return 0;
-    }
-
-    better_tau = refine_tau_with_parabolic_interpolation(yin, best_tau, max_tau);
-    if (better_tau <= 0.0f) {
-        return 0;
-    }
-
-    raw_frequency = (float)sample_rate / better_tau;
-    if (raw_frequency < YIN_MIN_PITCH_HZ || raw_frequency > YIN_MAX_PITCH_HZ) {
-        return 0;
-    }
-
-    result->raw_frequency_hz = (int)lroundf(raw_frequency);
-    result->confidence = 1.0f - yin[best_tau];
-    if (result->confidence < 0.0f) {
-        result->confidence = 0.0f;
-    }
-    if (result->confidence > 1.0f) {
-        result->confidence = 1.0f;
-    }
-
-    result->midi_note = frequency_to_midi_note(raw_frequency);
-    result->frequency_hz = midi_note_to_frequency(result->midi_note);
+    result->midi_note = best_midi_note;
+    result->frequency_hz = midi_note_to_frequency_hz(best_midi_note);
+    result->raw_frequency_hz = result->frequency_hz;
+    result->confidence = best_score;
     result->voiced = true;
+    result->fallback = false;
 
     return 1;
 }
 
-int pitch_detect_yin_hz(
+int pitch_detect_note_hz(
     const int16_t *samples,
     size_t sample_count,
     uint32_t sample_rate
 ) {
     PitchDetectionResult result;
 
-    pitch_detect_yin(samples, sample_count, sample_rate, &result);
+    pitch_detect_note(samples, sample_count, sample_rate, &result);
     return result.frequency_hz;
 }

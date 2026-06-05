@@ -12,14 +12,15 @@
 #include <softTone.h>
 #include <wiringPi.h>
 
-#define PITCH_WINDOW_MS 80U
-#define PITCH_HOP_MS 25U
-#define PITCH_MIN_WINDOW_SAMPLES 512U
+#define PITCH_WINDOW_MS 96U
+#define PITCH_HOP_MS 20U
+#define PITCH_MIN_WINDOW_SAMPLES 768U
 #define PITCH_MIN_HOP_SAMPLES 128U
-#define PITCH_MAX_WINDOW_SAMPLES 2048U
-#define PITCH_HOLD_HOPS 3U
-#define PITCH_CONFIRM_HOPS 2U
-#define PITCH_JITTER_PERCENT 5U
+#define PITCH_MAX_WINDOW_SAMPLES 4096U
+#define PITCH_HOLD_HOPS 4U
+#define PITCH_CONFIRM_HOPS 1U
+#define PITCH_JITTER_PERCENT 8U
+#define MELODY_INITIAL_CAPACITY 64U
 #define WAV_MIN(a, b) ((a) < (b) ? (a) : (b))
 
 typedef struct {
@@ -30,6 +31,17 @@ typedef struct {
     unsigned int pending_hops;
     unsigned int missing_hops;
 } PitchTracker;
+
+typedef struct {
+    int frequency_hz;
+    unsigned int duration_ms;
+} BuzzerNote;
+
+typedef struct {
+    BuzzerNote *notes;
+    size_t count;
+    size_t capacity;
+} MelodyBuffer;
 
 static pthread_mutex_t buzzer_lock = PTHREAD_MUTEX_INITIALIZER;
 static bool buzzer_state = false;
@@ -366,6 +378,195 @@ static size_t read_window_samples(
     return (size_t)samples_read;
 }
 
+/**
+ * Releases memory owned by a melody buffer.
+ * @param melody The melody buffer to clear.
+ */
+static void melody_buffer_cleanup(MelodyBuffer *melody) {
+    free(melody->notes);
+    melody->notes = NULL;
+    melody->count = 0;
+    melody->capacity = 0;
+}
+
+/**
+ * Ensures a melody buffer can store at least one more note.
+ * @param melody The melody buffer to grow.
+ * @return DEVICE_RESULT_OK on success, or an error code on allocation failure.
+ */
+static int melody_buffer_reserve_next(MelodyBuffer *melody) {
+    BuzzerNote *new_notes;
+    size_t new_capacity;
+
+    if (melody->count < melody->capacity) {
+        return DEVICE_RESULT_OK;
+    }
+
+    new_capacity = melody->capacity == 0 ? MELODY_INITIAL_CAPACITY : melody->capacity * 2U;
+    new_notes = realloc(melody->notes, new_capacity * sizeof(melody->notes[0]));
+    if (new_notes == NULL) {
+        return DEVICE_RESULT_DEVICE_FAILED;
+    }
+
+    melody->notes = new_notes;
+    melody->capacity = new_capacity;
+    return DEVICE_RESULT_OK;
+}
+
+/**
+ * Appends a note to a melody buffer, merging adjacent equal frequencies.
+ * @param melody The melody buffer to append to.
+ * @param frequency_hz The note frequency, or 0 for silence.
+ * @param duration_ms The note duration in milliseconds.
+ * @return DEVICE_RESULT_OK on success, or an error code on failure.
+ */
+static int melody_buffer_append(
+    MelodyBuffer *melody,
+    int frequency_hz,
+    unsigned int duration_ms
+) {
+    int result;
+
+    if (duration_ms == 0) {
+        return DEVICE_RESULT_OK;
+    }
+
+    if (frequency_hz < 0) {
+        frequency_hz = 0;
+    }
+
+    if (melody->count > 0 &&
+        melody->notes[melody->count - 1U].frequency_hz == frequency_hz) {
+        melody->notes[melody->count - 1U].duration_ms += duration_ms;
+        return DEVICE_RESULT_OK;
+    }
+
+    result = melody_buffer_reserve_next(melody);
+    if (result != DEVICE_RESULT_OK) {
+        return result;
+    }
+
+    melody->notes[melody->count].frequency_hz = frequency_hz;
+    melody->notes[melody->count].duration_ms = duration_ms;
+    melody->count += 1U;
+    return DEVICE_RESULT_OK;
+}
+
+/**
+ * Converts an opened WAV file into a precomputed buzzer-note array.
+ * @param file The WAV file stream positioned at the data chunk.
+ * @param info The parsed WAV metadata.
+ * @param melody The melody buffer to populate.
+ * @return DEVICE_RESULT_OK on success, or an error code on failure.
+ */
+static int build_melody_from_wav(
+    FILE *file,
+    const WavInfo *info,
+    MelodyBuffer *melody
+) {
+    uint32_t remaining_data_size = info->data_size;
+    int16_t samples[PITCH_MAX_WINDOW_SAMPLES];
+    size_t window_samples;
+    size_t hop_samples;
+    size_t active_samples;
+    PitchTracker pitch_tracker;
+
+    pitch_tracker_init(&pitch_tracker);
+
+    window_samples = samples_for_duration(info->sample_rate,
+        PITCH_WINDOW_MS,
+        PITCH_MIN_WINDOW_SAMPLES,
+        PITCH_MAX_WINDOW_SAMPLES);
+    hop_samples = samples_for_duration(info->sample_rate,
+        PITCH_HOP_MS,
+        PITCH_MIN_HOP_SAMPLES,
+        window_samples);
+    if (hop_samples >= window_samples) {
+        hop_samples = window_samples / 2U;
+    }
+    if (hop_samples == 0) {
+        hop_samples = 1;
+    }
+
+    active_samples = read_window_samples(file,
+        info,
+        samples,
+        0,
+        window_samples,
+        &remaining_data_size);
+
+    while (active_samples > 0) {
+        PitchDetectionResult detection;
+        int pitch_hz;
+        int result;
+        size_t play_samples;
+        unsigned int duration_ms;
+
+        if (is_stop_requested()) {
+            return DEVICE_RESULT_OK;
+        }
+
+        pitch_detect_note(samples, active_samples, info->sample_rate, &detection);
+        pitch_hz = pitch_tracker_update(&pitch_tracker, &detection);
+        log_pitch_debug(&detection, pitch_hz);
+
+        play_samples = WAV_MIN(hop_samples, active_samples);
+        duration_ms = samples_to_duration_ms(play_samples, info->sample_rate);
+
+        result = melody_buffer_append(melody, pitch_hz, duration_ms);
+        if (result != DEVICE_RESULT_OK) {
+            return result;
+        }
+
+        if (remaining_data_size == 0 && active_samples <= play_samples) {
+            break;
+        }
+
+        if (play_samples < active_samples) {
+            memmove(samples,
+                samples + play_samples,
+                (active_samples - play_samples) * sizeof(samples[0]));
+            active_samples -= play_samples;
+        }
+        else {
+            active_samples = 0;
+        }
+
+        active_samples += read_window_samples(file,
+            info,
+            samples,
+            active_samples,
+            window_samples,
+            &remaining_data_size);
+    }
+
+    return DEVICE_RESULT_OK;
+}
+
+/**
+ * Plays a precomputed melody note array through softTone.
+ * @param melody The precomputed melody to play.
+ * @return DEVICE_RESULT_OK when playback finishes or is stopped.
+ */
+static int play_melody(const MelodyBuffer *melody) {
+    size_t i;
+
+    for (i = 0; i < melody->count; i++) {
+        const BuzzerNote *note = &melody->notes[i];
+
+        if (!write_output_if_running(note->frequency_hz)) {
+            break;
+        }
+
+        if (!delay_until_done_or_stopped(note->duration_ms)) {
+            break;
+        }
+    }
+
+    stop_output(false);
+    return DEVICE_RESULT_OK;
+}
+
 int buzzer_init(void) {
     if (wiringPiSetupGpio() == -1) {
         return DEVICE_RESULT_GPIO_SETUP_FAILED;
@@ -388,18 +589,14 @@ int buzzer_music(char *file_path) {
     FILE *file;
     WavInfo info;
     int result;
-    uint32_t remaining_data_size;
-    int16_t samples[PITCH_MAX_WINDOW_SAMPLES];
-    size_t window_samples;
-    size_t hop_samples;
-    size_t active_samples;
-    PitchTracker pitch_tracker;
+    MelodyBuffer melody = { 0 };
 
     if (file_path == NULL || file_path[0] == '\0') {
         return DEVICE_RESULT_INVALID_VALUE;
     }
 
     clear_stop_request();
+    stop_output(false);
 
     file = fopen(file_path, "rb");
     if (file == NULL) {
@@ -417,75 +614,17 @@ int buzzer_music(char *file_path) {
         return DEVICE_RESULT_DEVICE_FAILED;
     }
 
-    remaining_data_size = info.data_size;
-    pitch_tracker_init(&pitch_tracker);
-
-    window_samples = samples_for_duration(info.sample_rate,
-        PITCH_WINDOW_MS,
-        PITCH_MIN_WINDOW_SAMPLES,
-        PITCH_MAX_WINDOW_SAMPLES);
-    hop_samples = samples_for_duration(info.sample_rate,
-        PITCH_HOP_MS,
-        PITCH_MIN_HOP_SAMPLES,
-        window_samples);
-    if (hop_samples >= window_samples) {
-        hop_samples = window_samples / 2U;
-    }
-    if (hop_samples == 0) {
-        hop_samples = 1;
-    }
-
-    active_samples = read_window_samples(file,
-        &info,
-        samples,
-        0,
-        window_samples,
-        &remaining_data_size);
-
-    while (active_samples > 0) {
-        PitchDetectionResult detection;
-        int pitch_hz;
-        size_t play_samples;
-        unsigned int duration_ms;
-
-        pitch_detect_yin(samples, active_samples, info.sample_rate, &detection);
-        pitch_hz = pitch_tracker_update(&pitch_tracker, &detection);
-        log_pitch_debug(&detection, pitch_hz);
-        if (!write_output_if_running(pitch_hz > 0 ? pitch_hz : 0)) {
-            break;
-        }
-
-        play_samples = WAV_MIN(hop_samples, active_samples);
-        duration_ms = samples_to_duration_ms(play_samples, info.sample_rate);
-        if (!delay_until_done_or_stopped(duration_ms)) {
-            break;
-        }
-
-        if (remaining_data_size == 0 && active_samples <= play_samples) {
-            break;
-        }
-
-        if (play_samples < active_samples) {
-            memmove(samples,
-                samples + play_samples,
-                (active_samples - play_samples) * sizeof(samples[0]));
-            active_samples -= play_samples;
-        }
-        else {
-            active_samples = 0;
-        }
-
-        active_samples += read_window_samples(file,
-            &info,
-            samples,
-            active_samples,
-            window_samples,
-            &remaining_data_size);
-    }
-
-    stop_output(false);
+    result = build_melody_from_wav(file, &info, &melody);
     fclose(file);
-    return DEVICE_RESULT_OK;
+    if (result != DEVICE_RESULT_OK) {
+        melody_buffer_cleanup(&melody);
+        stop_output(false);
+        return result;
+    }
+
+    result = play_melody(&melody);
+    melody_buffer_cleanup(&melody);
+    return result;
 }
 
 int buzzer_on(void) {

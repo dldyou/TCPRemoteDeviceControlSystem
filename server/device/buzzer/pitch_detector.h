@@ -15,14 +15,14 @@ typedef struct {
 } PitchDetectionResult;
 
 /**
- * Detects pitch from a PCM sample window using the YIN algorithm.
+ * Detects the strongest musical note in a PCM sample window.
  * @param samples The input signed 16-bit mono samples.
  * @param sample_count The number of input samples.
  * @param sample_rate The input sample rate in Hz.
  * @param result Receives frequency, confidence, RMS, and voiced state.
  * @return 1 when a voiced pitch is detected, 0 otherwise.
  */
-int pitch_detect_yin(
+int pitch_detect_note(
     const int16_t *samples,
     size_t sample_count,
     uint32_t sample_rate,
@@ -30,13 +30,13 @@ int pitch_detect_yin(
 );
 
 /**
- * Detects pitch using YIN and returns only the quantized frequency.
+ * Detects the strongest musical note and returns only its frequency.
  * @param samples The input signed 16-bit mono samples.
  * @param sample_count The number of input samples.
  * @param sample_rate The input sample rate in Hz.
  * @return The detected frequency in Hz, or 0 when no pitch is detected.
  */
-int pitch_detect_yin_hz(
+int pitch_detect_note_hz(
     const int16_t *samples,
     size_t sample_count,
     uint32_t sample_rate
