@@ -1,0 +1,40 @@
+1. Configuration
+- add 'config.ini' file at root of working directory:
+
+[Server]
+addr=your_server_ip_address
+port=your_server_port
+
+[RaspberryPi]
+RPI_USER=your_raspberry_pi_username
+RPI_IP=your_raspberry_pi_ip_address
+RPI_DEST=your_raspberry_pi_destination_path
+
+- library used: wiringPi, softPwm, softTone, math
+
+2. Build & Run
+- Build
+chmod +x ./build.sh
+./build.sh 
+
+- Run (Server)
+cd ~/TCPRemoteDeviceControlSystem
+./server
+
+- Run (Client)
+./build_client/client/client
+
+3. command examples
+- help
+- status
+- plugin list
+- led on
+- led off
+- led bright 100
+- buzzer on
+- buzzer off
+- buzzer beep 100
+- buzzer music metro.wav
+- light read
+- sed display 9
+- quit
