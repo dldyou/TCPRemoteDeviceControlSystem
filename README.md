@@ -1,4 +1,20 @@
 ﻿# TCP Remote Device Control System
+
+## Tech Stack
+- Language: C
+- Build: CMake, Shell Script
+- Platform: Raspberry Pi OS (64-bit), Ubuntu 24.04
+- Network: TCP Socket
+- Hardware: LED, Buzzer, Light Sensor(CDS), 7-segment
+- Toolchain: aarch64-linux-gnu-gcc
+
+## Key Features
+- TCP socket-based client-server communication
+- CLI command parsing and device control
+- LED brightness control, buzzer tone playback, light sensor reading, and 7-segment number display
+- Modularized Device Manager, Plugin Loader, and Logging components
+- Cross-compilation build script for Raspberry Pi 4
+
 ## Environment
 - Server: Raspberry Pi OS (64-bit)
 - Client: Ubuntu 24.04 LTS
